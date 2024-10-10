@@ -1,0 +1,593 @@
+---
+title: "clustering_invest_Strategy_validation"
+output: html_document
+date: "2024-10-01"
+editor_options: 
+  markdown: 
+    wrap: 80
+params:
+  is_load: FALSE  
+  is_prod: FALSE
+  clust_trial: "gmm_prod_exper1_1"
+  clust_trial2: "gmm_prod_exper1_1-simp_prod_exper1_3"
+  securities: "c('JT7203')"
+  no_cores: 16
+---
+
+# Task Overview
+
+-   This document details the steps for backtesting a portfolio based on
+    clustering model results. The portfolio rebalances at a regular frequency
+    (e.g., weekly or monthly).
+
+-   An investor utilizes the market situation determined by the clustering model
+    on the model calculation date and performs rebalancing on the trade date,
+    which is the day after the model calculation.
+
+-   The investor has insight into the performance of multiple financial
+    instruments from past data from periods with the same market conditions as
+    the model execution date, classified by the clustering model. Based on this
+    insight, the investor sells all current holdings and buys a selection of
+    financial instruments that performed well during those past periods,
+    rebalancing the portfolio according to the model’s recommendations. This
+    process is repeated following the regular rebalancing schedule.
+
+-   Referring to the past data from periods with the same market conditions as
+    the model calculation date is recognized as in-sample results, while the
+    investment results on the trade dates are recognized as out-of-sample
+    results.
+
+# Preset
+
+## Clean Up the R Environment
+
+-   Before running the clustering investment strategy, it is important to clean
+    the R environment to avoid any conflicts with previously loaded data or
+    objects. This ensures that only the necessary variables are available,
+    preventing unexpected behavior during execution.
+
+```{r}
+if(exists("params")){
+  keep_vars <- c("params", names(params))
+  rm(list = setdiff(ls(), keep_vars))
+}
+```
+
+## Loading Parameters from YAML Header
+
+-   The following parameters are loaded from the YAML header. These parameters
+    control whether to load existing clustering results or perform a new
+    analysis, and specify the trial configurations for the investment strategy.
+
+    -   `is_load`: Indicates whether to load previously generated results
+        (`TRUE`) or run a new analysis (`FALSE`).
+    -   `is_prod`: Indicates if the script is running in production mode. If
+        `TRUE`, results are saved in a designated location.
+    -   `clust_trial`: Defines a trial for the clustering analysis.
+    -   `clust_trial2`: Defines a trial for the combination of a clustering
+        analysis and a universe (a set of financial instruments).
+    -   `no_cores`: Specifies the number of CPU cores to use for parallel
+        processing. This helps optimize the performance of the clustering
+        analysis, especially when dealing with large datasets.
+    -  `securities`:Used in the create_instruments_return_data function to generate 
+    daily returns and total return indices for both long and short positions on these securities.
+
+```{r}
+if(exists("params")){
+  is_load = params$is_load
+  is_prod = params$is_prod
+  clust_trial = params$clust_trial 
+  clust_trial2 = params$clust_trial2 
+  no_cores = params$no_cores
+  securities = eval(parse(text = params$securities))
+}
+```
+
+## Required Libraries
+
+-   The following libraries are required for this analysis.
+
+```{r}
+library(tidyverse)
+library(conflicted)
+library(here)
+library(R6)
+library(reticulate)
+library(zoo)
+library(RcppPerfCalc)
+library(parallel)
+library(fst)
+
+conflicts_prefer(stats::dist)
+conflicts_prefer(dplyr::lag)
+conflicts_prefer(purrr::map)
+conflicts_prefer(dplyr::filter)
+
+```
+
+## Defined Functions and File Path
+
+-   This section loads custom-defined functions from various subfolders, and
+    sets the folder paths for loading R scripts and additional utility
+    functions.
+
+```{r warning=FALSE}
+sim_data_path  = paste0(here(""), "/sim_data")
+rcode_path     = paste0(here(""), "/R")
+data_save_path = paste0(sim_data_path, "/data/") 
+data_save_file_path = paste0(data_save_path, "eq_tri_tbl.rds")
+# Load custom R functions from various directories
+for (subfolder in c("cluster", "backtest", "utils", "finance")) {
+  list.files(here("R", subfolder), "\\.R$", full.names = TRUE) %>% 
+    lapply(source)
+  list.dirs(here("R", subfolder), recursive = FALSE) %>% 
+    list.files("\\.R$", full.names = TRUE) %>% 
+    lapply(source)
+}
+source(paste0(rcode_path, "/run_setup.R"))
+```
+
+# Preparation
+
+## Calculate price return index
+
+-   Since we cannot retrieve dividend information for stock indices (e.g., NKY,
+    SPX) via Yahoo Finance, calculating a Total Return Index (TRI) is not
+    feasible.
+
+-   On the other hand, stocks and ETFs include dividend information in Yahoo
+    Finance. In this report, I include data for Toyota and the SPX ETF, but not
+    for NKY and TPX ETFs, which lack sufficient historical records.
+
+-   Recommendation: If you require a Total Return Index (TRI) for NKY and TPX,
+    you will need to manually source or collect dividend information from
+    reliable data providers and adjust the index calculations accordingly.
+
+
+```{r}
+
+mkt_start_dt = as.Date("2000-01-01")
+mkt_data_tbl = create_market_data_for_clustering2(start_dt = mkt_start_dt)
+return_result_tbl = create_instruments_return_data(mkt_data_tbl, securities)
+eq_ror_tbl = return_result_tbl$eq_ror_tbl
+eq_tri_tbl = return_result_tbl$eq_tri_tbl
+dir.create(data_save_path, FALSE)
+eq_ror_tbl %>% saveRDS(paste0(data_save_path, "eq_ror_tbl.rds"))
+eq_tri_tbl %>% saveRDS(paste0(data_save_path, "eq_tri_tbl.rds"))
+
+```
+
+## Set up clust_handler and clust_handler2
+
+-   We use the `ParameterResultHandler` class to manage parameter sets and their
+    corresponding results. `clust_handler` is used similarly to how it is in
+    `clustering_model_generation.Rmd`, while `clust_handler2` manages the
+    combination of clustering analysis parameters and universe information,
+    along with their corresponding backtest results.
+
+```{r}
+clust_save_path = file.path(sim_data_path, "clust") %+% "/"
+clust_handler = ParameterResultHandler$new(clust_save_path)
+clust_handler2 = clust_handler$create_subdir_obj("expand", primary_keys = "seq_id2")
+# handler = ParameterResultHandler$new(file.path(sim_data_path, "tsd") %+% "/", is_old = F)
+```
+
+## Loading Clustering Results
+
+-   The following code loads the parameters and results for the specified
+    clustering trial.
+
+-   Notuce: You should generate clustering results about `clust_trial` in
+    clustering_model_generation.Rmd. The objects related to the clustering
+    models are as follows:
+
+-   `clust_param_tbl`: Loads the parameter tibble for the trial defined by
+    `clust_trial`.
+
+-   `clust_result_tbl`: Loads the clustering results for the trial, with the
+    results saved under the name `clust_result_tbl`.
+
+-   `clust_start_dt`: Extracts the start date of the clustering process from the
+    parameter table.
+
+```{r}
+clust_param_tbl  = clust_handler$load_params(clust_trial)
+clust_result_tbl = clust_handler$load_results(result_name = "clust_result_tbl", 
+                                              trial = clust_trial)
+clust_start_dt   = clust_param_tbl$start_dt[[1]]
+
+```
+
+## Clustering Invest Parameters
+
+-   `clust_all_param_tbl` includes a combination of information from
+    `clust_param_tbl` and additional investing parameters generated in
+    `run_setup.R`. The `clust_trial2` represents a combination of a universe (a
+    set of financial instruments) and the criteria parameters used to select the
+    best instruments from past data from periods with the same market conditions
+    as the model execution date, classified by by the `clust_trial` model.
+
+```{r}
+save_path = paste0(data_save_path, "/eq_tri_tbl.rds")
+tri_file_loader = TriFileLoader$new(file_path      = data_save_file_path,
+                                    from_file_type = "yf_path")
+arg_list = getListFromObjs(clust_handler, tri_file_loader)
+tmp = execute_clust_invest_setting_factory_element(
+  CLUST_INVEST_SETTING_FACTORY, clust_trial2, arg_list)
+clust_all_param_tbl = tmp$clust_all_param_tbl
+config_tbl          = tmp$config_tbl
+all_tri_tbl         = tmp$tri_tbl
+
+clust_handler2$set_params(clust_trial2, clust_all_param_tbl)
+clust_handler2$save_config(clust_trial2, config_tbl)
+
+clust_all_param_tbl = clust_handler2$load_params(clust_trial2)
+```
+
+-   The columns other than `clust_param_tbl` are shown below.
+
+    -   `trial`: The name of the clustering analysis trial, referring to
+        `clust_trial`. This identifies the specific clustering model
+        configuration used in the analysis. In this example:
+        `"gmm_prod_exper1_1"`(indicating a Gaussian Mixture Model trial)
+
+    -   `universe`: The set of financial instruments for investment. It defines
+        the scope of instruments included in the analysis. In this example:
+        `"SPX_ETF_LONG_ONLY"` (meaning a long-only strategy for SPX ETFs)
+
+    -   `criteria`:The selection criteria used to rank the instruments. This
+        could be based on metrics like Sharpe ratio or other performance
+        indicators. In this example: "shr" (representing Sharpe ratio)
+
+    -   `n_top`:The number of top-performing instruments selected based on the
+        specified criteria on past data from periods with the same market
+        conditions as the model execution date, classified by the clustering
+        model. In this example: `1` (indicating the top 1 instrument is
+        selected)
+
+    -   `prob_inf`: This represents a threshold used to compare the membership
+        probabilities generated by clustering models like Gaussian Mixture Model
+        (GMM). GMM provides a probability indicating how strongly each data
+        point belongs to a specific cluster. The `prob_inf` value is the
+        threshold used to evaluate whether a data point's membership probability
+        in past periods is high enough to be confidently assigned to a cluster.
+        Data points that meet this threshold are then used in the insample
+        backtest.
+
+        -   For models that do not provide probabilities (e.g., K-means), the
+            membership probability is always considered zero. In such cases, all
+            data from past periods are used unconditionally in insample the
+            backtest.
+
+    -   `ar_inf`: This represents a threshold used to compare the annualized
+        return for each instrument in past periods with the same market
+        conditions as the model execution date, classified by the clustering
+        model. Instruments will be removed if their annualized return is lower
+        than this value. In this example: `NA` (no AR filtering applied). #CHECK
+
+    -   `reb_freq`:The rebalancing frequency, which determines how often the
+        portfolio is rebalanced.In this example: `"1w"` (indicating weekly
+        rebalancing), `"2w"` (bi-weekly), `"eom"` (end of month)
+
+    -   `wd_no`:Likely represents the number of weekdays associated with the
+        rebalance schedule. If this value is 3 and reb_freq = "1w", the
+        rebalance schedules in 2024/01 are 1/10, 1/17. 1/24 and 1/31(since 1/3
+        is a Japan Holiday). In this context, Monday is represented as day 1
+
+    -   `codes`: A list of instruments traded in the backtest. In the backtest,
+        these instruments are filtered by `ar_inf` and `prob_inf`, and selected
+        based on the `criteria`. The top `n_top` instruments are chosen
+        according to the defined criteria.In this Example: c("SPX_ETF_TRI_LONG",
+        "ZERO" )
+
+    -   `trial2`:Identifies `clust_trial2`.In this example:
+        `"gmm_prod_exper1_1-simp_exper4_1"`
+
+```{r}
+clust_all_param_tbl 
+
+```
+
+## Rebalance Schedule Params and Historical Daily returns
+
+-   A rebalance schedule is a set of dates that includes the calculation of a
+    clustering model, opening a position, and closing a position.
+
+-   `w_bds_tbl` is a tibble that contains the holding dates based on Japanese
+    holidays.
+
+-   `all_w_bds_plp_tbl` includes daily returns on the dates from `w_bds_tbl` for
+    the following financial instruments: JT7203_TRI_LONG, JT7203_TRI_SHORT,
+    SPX_ETF_TRI_LONG, SPX_ETF_TRI_SHORT, and ZERO. Their meanings are explained
+    below.
+
+    -   "XXX_TRI_LONG" ("XXX_TRI_SHORT") refers to the daily return when holding
+        a long (short) position on XXX instrument.
+
+    -   "ZERO" refers to the daily return when no financial instruments are
+        held. In other words, it represents the daily return as if the money
+        were deposited in a bank account with a zero interest rate.
+
+-   `reb_sche_nest_tbl` represents the rebalance schedules, showing how the
+    rebalancing frequency is structured and contains the `reb_freq` and `wd_no`
+    values related to clust_all_param_tbl. The `reb_sche` column contains a
+    tibble with the rebalance schedule, which corresponds to the `reb_freq` and
+    `wd_no` values in the same row. The columns in `reb_sche` are shown below.
+
+    -   `ref_date`: This represents the model calculation date for the
+        clustering model.
+
+    -   `h_start`: The start date of the holding period. On this date, positions
+        are opened based on the signals generated by the model on the
+        `ref_date`. Trades are executed on the next trading day after the
+        positions are identified.
+
+    -   `h_end`: The end date of the holding period. Positions are held until
+        this date, and all trades are closed by the next trading day to realize
+        profits. If positions are held across multiple periods, separate
+        `h_start` and `h_end` dates are defined for each period.
+
+```{r}
+start_dt  = config_tbl$start_dt[[1]]
+end_dt    = config_tbl$end_dt[[1]]
+# reb_freqs = config_tbl$reb_freqs[[1]]
+# plp_type  = config_tbl$plp_type[[1]]
+   
+w_bds_tbl =readRDS(data_save_path %+% "w_bds_tbl.rds")
+# trade_w_bds_tbl =readRDS(data_save_path %+% "trade_w_bds_tbl.rds")
+trade_w_bds_tbl = w_bds_tbl
+
+all_w_bds_plp_tbl = create_d_ror_tbl_from_all_tri_tbl(w_bds_tbl, all_tri_tbl, T) %>% 
+  drop_na() 
+reb_sche_nest_tbl = create_reb_sche_nest_tbl(w_bds_tbl, config_tbl)
+```
+
+-   Additionally, the holding period is extended when the next `ref_date` falls
+    on a holiday, based on `w_bds_tbl`. As shown in the example below, for the
+    holding period with a `ref_date` of "2000-12-26", the `h_end` is not
+    "2001-01-03" but "2001-01-10". This is because "2001-01-03" is a holiday
+    according to `w_bds_tbl`.
+
+```{r}
+reb_sche_nest_tbl$reb_sche[[1]] %>% 
+  filter(ref_date >= "2000-12-26") %>% 
+  head(3)
+```
+
+# Insample
+
+## Generate setup
+
+-   `clust_result_reb_sche_tbl` integrates the clustering results from
+    `clust_result_tbl` with the rebalance schedules in `reb_sche_nest_tbl` and
+    is used to align the clustering model's outcomes with the rebalance schedule
+    dates. It includes not only the clustering model's parameters and rebalance
+    schedules, but also processed in-sample inputs such as `is_clust_tbl`,
+    `ref_category`, and `ref_prob`. The prefix 'ref' refers to the model
+    calculation date. These columns are explained below:
+
+    -   `is_clust_tbl`: Stores information about how the rebalance schedules and
+        the probabilities generated by the clustering model before the model
+        calculation date are organized.
+
+    -   `ref_category`: The category assigned to a cluster for each model
+        calculation date.
+
+    -   `ref_prob`: The probability of belonging to a cluster for each model
+        calculation date.
+
+```{r}
+ clust_result_reb_sche_tbl = clust_result_tbl %>%  
+    group_nest(clust_num, ref_name, model_name)  %>% 
+    expand_grid(reb_sche_nest_tbl) %>% 
+    rowwise() %>% 
+    mutate(
+      data = reb_sche %>% 
+        left_join(data %>% select(ref_date, is_clust_tbl, ref_category, ref_prob), 
+                  by = join_by(ref_date)) %>%
+        drop_na(is_clust_tbl) %>% 
+        list()
+    ) %>% 
+    unnest(cols = c(data)) %>% 
+    filter(h_start %in% trade_w_bds_tbl$date) %>% rowwise() %>% 
+    mutate(
+      is_clust_tbl = is_clust_tbl %>% 
+        bind_rows() %>% 
+        rename(sim_ref_date = date) %>%
+        left_join(reb_sche %>% 
+                    rename_with(~ paste0("sim_", .x)), by = join_by(sim_ref_date)) %>%
+        drop_na(sim_h_start) %>% 
+        filter(sim_h_end < h_start)　%>% 
+        list()
+    ) %>% 
+    select(-reb_sche ) %>% 
+    ungroup()
+```
+
+-   This chunk executes parallel computations to generate position histories
+    with probabilities for each row in `clust_result_reb_sche_tbl`. The
+    resulting `clust_is_setup_tbl` is an extension of
+    `clust_result_reb_sche_tbl` and contains not only these position histories
+    as `sim_pos_dates`, but also in-sample parameters such as `n_top`,
+    `prob_inf`, `ar_inf`, and `reb_freq` from `clust_all_param_tbl`.
+
+```{r}
+if(!is_load){
+  
+  system.time({
+    temp = create_global_objects_for_plp_from_clust_pos_info_tbl(w_bds_tbl)
+    global_f = temp$f
+    global_variables = temp$variables
+    # Defining Objects in the Global Environment
+    environment(global_f) <- .GlobalEnv
+    list2env(global_variables, envir = .GlobalEnv)
+    environment(execute_parallel_computation_on_splits) <- .GlobalEnv
+    
+    clust_pos_info_tbl = execute_parallel_computation_on_splits(
+      clust_result_reb_sche_tbl, split_function, no_cores = no_cores,
+      add_libraries = c("mclust", "here", "R6")) %>% 
+      select(-is_clust_tbl) %>%
+      group_nest(clust_num, ref_name, model_name, reb_freq, wd_no)
+    rm(global_f, global_variables)
+   #             ユーザ            システム                経過  
+   # 142.050000000000   2.840000000000 738.040000000001 
+    gc()
+    gc()
+  })
+  clust_is_setup_tbl = clust_all_param_tbl %>% 
+    left_join(clust_pos_info_tbl) %>% 
+    unnest(data)
+  
+  clust_handler2$save_results(clust_trial2, "clust_is_setup_tbl", clust_is_setup_tbl)
+}else{
+  clust_is_setup_tbl = clust_handler2$load_results("clust_is_setup_tbl", clust_trial2)
+  
+}
+
+```
+
+## Generate Results
+
+-   This chunk executes parallel computations to:
+
+    -   Make weights by evaluating whether `prob` exceeds `prob_inf` in
+        `sim_pos_dates` within `clust_is_setup_tbl`.
+
+    -   Calculate daily returns from weights for past periods that share the
+        same market conditions as the model execution date, classified by the
+        clustering model.
+
+    -   Calculate in-sample results, specifically determining which financial
+        instruments to invest in on the trade date, the day following the model
+        calculation. These in-sample results are the final output of the
+        parallel computations, stored in `clust_is_result_tbl`, and are
+        generated using inputs such as daily returns from those past periods,
+        applying rules based on in-sample parameters such as `criteria`,
+        `n_top`, `prob_inf`, `ar_inf`, and `reb_freq`.
+
+```{r}
+
+if(!is_load){
+  keys_origin_dict = list(code = "ZERO")
+  # rules based on in-sample parameters
+  rule_param_tbl = clust_all_param_tbl %>% 
+    distinct(criteria, n_top, ar_inf) %>% 
+    mutate(exec_pct_inf = NA)
+  
+  tmp = create_global_objects_for_parallel_clust_is_result(
+    keys_origin_dict, rule_param_tbl, all_w_bds_plp_tbl,
+      
+    is_debug = F 
+  )
+  global_f = tmp$f
+  global_variables = tmp$variables
+
+
+  #グローバル環境でのオブジェクト定義
+  environment(global_f) <- .GlobalEnv
+  list2env(global_variables, envir = .GlobalEnv)
+  environment(execute_parallel_computation_on_splits) <- .GlobalEnv
+  # split_function2 = function(x) split_function(x, N = N)
+  clust_is_result_tbl = clust_is_setup_tbl %>% 
+    mutate(id=row_number()) %>% 
+    arrange(desc(ref_date)) %>% 
+    execute_parallel_computation_on_splits(
+      split_function, no_cores = no_cores, 
+      add_libraries = c("here", "R6"))
+   rm(global_f, global_variables)
+  
+  clust_handler2$save_results(clust_trial2, "clust_is_result_tbl", clust_is_result_tbl)
+}else{
+  clust_is_result_tbl = clust_handler2$load_results(result_name =  "clust_is_result_tbl", trial = clust_trial2)
+
+}
+
+```
+
+# Out-of-Sample
+
+## Generate Results
+
+-   `c_rate` represents the trading cost incurred when executing trades on
+    financial instruments based on recommendations from the in-sample results.
+    In this document, `c_rate` is set to 5 basis points (bp).
+
+-   Recommendation: The 5bp trading cost is an approximate value for highly
+    liquid equities. If you have access to more accurate data from sources like
+    Bloomberg or Reuters, please adjust the cost accordingly.
+
+-   The function `create_clust_os_setup_tbl` generates calculates out-of-sample
+    results (`clust_os_result_tbl`) based on in-sample results and trading
+    schedules. It first expands the backtest schedule from `clust_is_result_tbl`
+    and transforms the date range into individual trading days, evenly
+    distributing positions across the schedule. Then, it merges the trading
+    schedule with the total return index to create a daily return table for all
+    instruments. Finally, position weights are calculated and used to compute
+    the portfolio's daily performance, which is returned as
+    `clust_os_result_tbl`.
+
+```{r}
+c_rate = 0.0005
+
+if(!is_load){
+
+  clust_trade_w_bds_tbl = trade_w_bds_tbl %>% 
+    filter(date >= clust_start_dt)
+  
+  # c_rate = if(plp_type=="tsd") 0.0 else c_rate
+  clust_os_result_tbl = create_clust_os_setup_tbl(
+    clust_is_result_tbl, clust_all_param_tbl, clust_trade_w_bds_tbl, all_tri_tbl, 
+    c_rate=c_rate, id_name = "seq_id2")
+
+  clust_handler2$save_results(clust_trial2, "clust_os_result_tbl", clust_os_result_tbl)
+}else{
+  clust_os_result_tbl = clust_handler2$load_results(result_name =  "clust_os_result_tbl", trial = clust_trial2)
+}
+
+
+```
+
+## Extract Data
+
+-   In this chunk, time series data such as daily returns, total return indices,
+    and portfolio performance for the out-of-sample period are extracted from
+    `clust_os_result_tbl`.
+
+```{r}
+if(!is_load){
+  
+  clust_os_plp_tbl = clust_os_result_tbl %>% 
+    # select(clust_num, ref_name, model_name, codes, d_plp_tbl) %>% 
+    select(-data , -d_weight_tbl_s) %>% 
+    ungroup() %>% 
+    unnest(d_plp_tbl) %>% 
+    rename(update_codes = codes)
+  clust_handler2$save_results(clust_trial2, "clust_os_plp_tbl", clust_os_plp_tbl)
+  
+  clust_os_perf_tbl = clust_os_plp_tbl %>% 
+    select(seq_id2, update_codes,  date, port)  %>% 
+    create_perf_tbl(c("seq_id2", "update_codes"), "port") %>% 
+    left_join(clust_all_param_tbl, by = join_by(seq_id2)) %>% 
+    select(clust_all_param_tbl %>% colnames(), everything())
+  clust_handler2$save_results(clust_trial2, "clust_os_perf_tbl", clust_os_perf_tbl)
+  
+  clust_os_tri_tbl = clust_os_plp_tbl %>% 
+    select(-update_codes) %>% 
+    with_cumrets2("date",  "seq_id2", "port")
+  clust_handler2$save_results(clust_trial2, "clust_os_tri_tbl", clust_os_tri_tbl)
+
+}
+
+
+
+```
+
+```{r}
+clust_os_perf_tbl %>% 
+  mutate(name = paste0(universe, "_", reb_freq)) %>% 
+  bind_rows(eq_ror_tbl %>% 
+              filter(date >= clust_start_dt & date <= end_dt)%>% 
+              create_perf_tbl2(indeces = "date")) %>% 
+  select(name, ar, sd, dd, shr, sor, str)
+
+```

@@ -1,0 +1,301 @@
+---
+title: "clustering_model_generation"
+output: html_document
+date: "2024-10-01"
+editor_options: 
+  markdown: 
+    wrap: 80
+params:
+  is_load: FALSE  
+  is_prod: TRUE
+  clust_trial: "gmm_prod_exper1_1" 
+  no_cores: 16
+---
+
+# Task Overview
+
+-   This document details the steps for validating a clustering model used to
+    classify non-linear market regimes. The main tasks involve configuring
+    market signals and the clustering model itself.
+
+## Market Signal Selection
+
+-   Define the combination of market signals that the model will focus on, such
+    as volatility or interest rates.
+
+## Model Selection
+
+-   Choose the appropriate clustering model (e.g., K-means, Gaussian Mixture
+    Model).
+
+# Preset
+
+## Clean Up the R Environment
+
+-   Before running the clustering model, it is important to clean the R
+    environment to avoid any conflicts with previously loaded data or objects.
+    This ensures that only the necessary variables are available, preventing
+    unexpected behavior during execution.
+
+-   In the following code, we preserve the `params` object, which contains the
+    parameters from the YAML header, and remove all other objects from the
+    environment.
+
+```{r}
+if(exists("params")){
+  keep_vars <- c("params", names(params))
+  rm(list = setdiff(ls(), keep_vars))
+}
+```
+
+## Loading Parameters from YAML Header
+
+-   The following parameters are loaded from the YAML header. These parameters
+    control whether to load existing clustering results or perform a new
+    analysis, and specify the trial configurations for the investment strategy.
+
+    -   `is_load`: Determines whether to load previously generated clustering
+        results (`is_load = TRUE`) or to perform a new clustering analysis
+        (`is_load = FALSE`).
+
+    -   `is_prod`: Indicates whether the script is running in production mode.
+        If `TRUE`, the generated results are saved in the designated storage
+        location. If `FALSE`, the generated results are not saved.
+
+    -   `clust_trial`: The name of the current trial for the clustering
+        analysis. This parameter integrates the market signals and the
+        clustering model configuration for the trial. The possible values for
+        `clust_trial` are defined in `run_setup.R`.
+
+    -   `no_cores`: Specifies the number of CPU cores to use for parallel
+        processing. This helps optimize the performance of the clustering
+        analysis, especially when dealing with large datasets.
+
+```{r}
+if(exists("params")){
+  is_load = params$is_load
+  is_prod = params$is_prod
+  clust_trial = params$clust_trial 
+  no_cores = params$no_cores
+}
+```
+
+## Required Libraries
+
+-   The following libraries are needed for this analysis:
+
+    -   Some functions are conflicted between libraries. Therefore, we use
+        `conflicts_prefer` to explicitly specify which functions to use when
+        conflicts occur.
+
+```{r}
+
+library(tidyverse)
+library(mclust)
+library(conflicted)
+library(here)
+library(R6)
+library(zoo)
+library(rlang)
+library(reticulate)
+library(parallel)
+library(fst)
+
+conflicts_prefer(stats::dist)
+conflicts_prefer(dplyr::lag)
+conflicts_prefer(purrr::map)
+conflicts_prefer(dplyr::filter)
+ 
+```
+
+## Defined Functions and File Path
+
+-   The following code loads custom-defined functions and sets the folder paths
+    for saving generated data and for the R code directory.
+
+    -   `sim_data_path`: Specifies the path where generated data will be saved.
+
+    -   `rcode_path`: Specifies the directory where the R code files are
+        located.
+
+```{r}
+
+sim_data_path = paste0(here(""), "/sim_data")
+rcode_path = paste0(here(""), "/R")
+
+for (subfolder in c("cluster", "sqlite", "utils", "finance")) {
+  list.files(here("R", subfolder), "\\.R$", full.names = TRUE) %>% 
+    lapply(source)
+  list.dirs(here("R",subfolder), recursive = FALSE) %>% 
+    list.files("\\.R$", full.names = TRUE) %>% 
+    lapply(source)
+}
+source(paste0(rcode_path, "/run_setup.R"))
+```
+
+# Flow
+
+-   The clustering model is executed for each model execution date within the
+    period from `clust_start_dt` to `clust_end_dt`.
+
+-   On each model execution date, the clustering model incrementally
+    incorporates new market data from `mkt_start_dt` to `clust_start_dt`. This
+    allows the model to adjust to evolving market conditions and refine the
+    classification of market regimes as additional data becomes available.
+
+-   This report saves the clustering model parameters in `clust_param_tbl` and
+    their corresponding execution results in `clust_result_tbl`.
+
+-   The ParameterResultHandler class manages parameter sets and their
+    corresponding results. In this report, the parameter sets are stored in
+    param_tbl, and the corresponding results are stored in clust_result_tbl.
+    This class saves param_tbl and clust_result_tbl, which are generated during
+    the clustering process.
+
+# Preparation
+
+## Market Data
+
+-   This function loads market data from Yahoo Finance using the Python library
+    yfinance. The retrieved data will be stored in mkt_data_tbl, a wide-format
+    tibble. Please set up an Anaconda environment to run the function or,
+    alternatively, prepare your own market data and assign it to mkt_data_tbl.
+
+-   From Yahoo Finance, the function retrieves data for the following symbols:
+    USDJPY (Japanese Yen to US Dollar exchange rate), SPX (S&P 500 index), VIX
+    (Volatility Index), USGG2YR (US 2-year Treasury yield), and USGG10YR (US
+    10-year Treasury yield).
+
+-   The mkt_data_tbl contains the following columns: date, USDJPY, SPX, VIX,
+    USGG2YR, and USGG10YR. If you do not use an Anaconda environment, ensure
+    that your custom market data contains these columns, with historical values
+    that match the date range specified in the function.
+
+```{r warning=FALSE, message = FALSE}
+mkt_start_dt = as.Date("2000-01-01")
+mkt_data_tbl = create_market_data_for_clustering2(
+                                                  start_dt = mkt_start_dt) %>%
+  mutate(is_nenmatsu = year(date) != lead(year(date)), 
+         is_nenmatsu = replace_na(is_nenmatsu, T)
+  )  
+
+
+```
+
+## Clustering Parameters
+
+-   clust_param_tbl includes the market signals and clustering model parameters
+    generated in run_setup.R. The clust_trial represents a combination of the
+    market signals and clustering model parameters, allowing you to select
+    options such as "GMM_PROD_EXPER1" or "KMEANS_PROD_EXPER1".
+
+```{r}
+clust_start_dt = "2002-01-01"
+clust_end_dt   = "2023-12-31"
+
+save_path = file.path(sim_data_path, "clust") %+% "/"
+
+clust_config_setting = env_get(CLUST_CONFIG_SETTING, clust_trial)
+clust_trial 　　　　 = clust_config_setting$clust_trial
+clust_param_tbl      = clust_config_setting$clust_param_tbl
+
+clust_handler = ParameterResultHandler$new(save_path)
+clust_handler$set_params(clust_trial, clust_param_tbl)
+```
+
+-   The clust_param_tbl is shown in the following chunk, and its columns are
+    explained below:
+
+    -   `model_name`: The name of the clustering model being used. In this
+        example, the model is "GMM" (Gaussian Mixture Model).
+
+    -   `lib_name`: The name of the library used to implement the clustering
+        model. In this example, the library is "Mclust," which is commonly used
+        for Gaussian Mixture Model clustering in R.
+
+    -   `start_dt`: The start date for the market data used in the clustering
+        process. In this example, the start date is "2002-01-01."
+
+    -   `seed`: The random seed used to ensure reproducibility of the clustering
+        results. The seed is set to `123` in this example.
+
+    -   `clust_num`: The number of clusters to be formed in the clustering
+        model. In this case, the model is set to form `3` clusters.
+
+    -   `ref_name`: A list of reference market signals or features used as
+        inputs for the clustering model. In this example, the reference signals
+        are "VIX" (Volatility Index) and "USGG10YR" (US 10-year Treasury yield).
+
+    -   `clust_trial`: The name or identifier for the current trial of the
+        clustering process. It helps to distinguish between different experiment
+        runs. In this case, the trial is named "gmm_prod_exper1_1."
+
+    -   `comb_ref_name`: A string representing the combination of reference
+        market signals used in the clustering model. It is generated from the
+        `ref_name` list. In this example, the combination is "VIX\@USGG10YR",
+        indicating that both the VIX and USGG10YR signals are used together.
+
+```{r}
+clust_param_tbl
+```
+
+-   The `clust_param_date_tbl` loads the `clust_param_tbl` for each model
+    execution date.
+
+```{r}
+date_tbl = mkt_data_tbl %>% 
+  filter(date >= clust_start_dt) %>% 
+  select(date, is_nenmatsu)
+
+clust_param_date_tbl = clust_param_tbl %>% rowwise() %>% 
+  mutate(date_tbl = date_tbl %>% list()) %>% 
+  unnest(c(date_tbl )) %>% 
+  rename(save_graphs = is_nenmatsu) %>% 
+  rename(ref_date = date)
+clust_param_date_tbl  
+
+```
+
+# Generate
+
+-   This chunk executes parallel computations for each model execution date,
+    using `clust_param_date_tbl` and `mkt_data_tbl` as inputs.
+
+```{r}
+if(!is_load){
+
+  obj = create_global_objects_for_parallel_cluster_model(mkt_data_tbl)
+  global_f = obj$f
+  global_variables = obj$variables
+  
+  #グローバル環境でのオブジェクト定義
+  environment(global_f) <- .GlobalEnv
+  list2env(global_variables, envir = .GlobalEnv)
+  environment(execute_parallel_computation_on_splits) <- .GlobalEnv
+  
+  clust_result_tbl = execute_parallel_computation_on_splits(
+    clust_param_date_tbl, split_function, 
+    add_libraries = c("mclust", "here", "R6", "rlang"), no_cores = no_cores) 
+  rm(global_f, global_variables)
+  if(is_prod){
+    clust_handler$save_results(clust_trial, "clust_result_tbl", clust_result_tbl)  
+  }
+  
+}else{
+  
+  clust_result_tbl = clust_handler$load_results(result_name =  "clust_result_tbl", trial = clust_trial)
+}
+
+
+```
+
+```{r}
+clust_result_tbl
+```
+
+```{r}
+obj = clust_result_tbl %>% 
+  filter(ref_date == max(ref_date)) %>% 
+  pull(obj) %>% magrittr::extract2(1) 
+
+```
