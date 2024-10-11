@@ -200,14 +200,22 @@ Finally, I have consolidated the R code from the above flow into
     -   `parallel`
     -   `rmarkdown`
     -   `fst`
+    -   `PerformanceAnalytics`
+    -   `RcppArmadillo`
+    -   `assertr`
+    -   `lubridate`
 
 To install all required R packages, run the following command in your R environment:
 
 ``` r
-install.packages(c("tidyverse", "mclust", "conflicted", "here", "R6", "zoo", "rlang", "reticulate", "parallel", "rmarkdown", "fst"))
+install.packages(c("tidyverse", "mclust", "conflicted", "here", "R6", "zoo", "rlang", "reticulate", "parallel", "rmarkdown", "fst", "PerformanceAnalytics", "RcppArmadillo", "assertr", "lubridate"))
 ```
 
-In addition, you will need to install the custom `RcppPerfCalc` package directly from the GitHub release. This package is specifically designed to optimize the execution time when evaluating historical performance in past market regimes, which serves as in-sample data for generating Clustering Investment Strategy results. Utilizing this package will significantly enhance the speed and efficiency of the calculations involved.
+In addition, you will need to install the custom `RcppPerfCalc` package directly from the GitHub release. 
+
+Before installing the custom `RcppPerfCalc` package, please make sure that `Rtools` is installed on your system. `Rtools` is required to compile and build the package from the source.
+
+This package is specifically designed to optimize the execution time when evaluating historical performance in past market regimes, which serves as in-sample data for generating Clustering Investment Strategy results. Utilizing this package will significantly enhance the speed and efficiency of the calculations involved.
 
 To install the `RcppPerfCalc` package, run the following command:
 
