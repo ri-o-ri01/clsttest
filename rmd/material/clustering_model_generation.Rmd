@@ -244,7 +244,7 @@ clust_param_tbl
 
 ```{r}
 date_tbl = mkt_data_tbl %>% 
-  filter(date >= clust_start_dt) %>% 
+  filter(date >= clust_start_dt & date <= clust_end_dt) %>% 
   select(date, is_nenmatsu)
 
 clust_param_date_tbl = clust_param_tbl %>% rowwise() %>% 

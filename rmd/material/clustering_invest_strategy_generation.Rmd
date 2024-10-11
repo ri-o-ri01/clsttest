@@ -10,7 +10,7 @@ params:
   is_prod: FALSE
   clust_trial: "gmm_prod_exper1_1"
   clust_trial2: "gmm_prod_exper1_1-simp_prod_exper1_3"
-  securities: "c('JT7203')"
+  securities: "c('SPX_ETF')"
   no_cores: 16
 ---
 

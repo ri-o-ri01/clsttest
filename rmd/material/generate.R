@@ -8,7 +8,7 @@ cmg_name = "GMM_PROD_EXPER1"
 
 ## For clustering_invest_strategy_generation.Rmd ---------------------------
 exe_clustering_invest_strategy=TRUE
-cisg_name = "GMM_PROD_EXPER1-SIM_PROD_EXPER1"
+cisg_name = "GMM_PROD_EXPER1-SIMP_PROD_EXPER1"
 
 # Setup -------------------------------------------------------------------
 library(tidyverse)
@@ -75,13 +75,15 @@ if(exe_clustering_invest_strategy){
     row = temp_info_tbl[iii, ]
     print(iii)
     print(temp_info_tbl[iii, ])
-    clust_trial = row[1, ]$clust_trial
+    clust_trial  = row[1, ]$clust_trial
     clust_trial2 = row[1, ]$clust_trial2
+    securities   = deparse(as.call(list(as.name("c"), row[1, ]$securities[[1]])))　
     source(paste0(here(""), "/rmd/material/", "/background_job_helper.R"))
     tgt_params2 = list(
-                       clust_trial = clust_trial,
-                       clust_trial2 = clust_trial2,
-                       no_cores = no_cores
+      clust_trial = clust_trial,
+      clust_trial2 = clust_trial2,
+      no_cores = no_cores,
+      securities = securities
     )
     my_env$my_render("clustering_invest_strategy_generation.Rmd", tgt_params2)
     temp_info_tbl = readRDS(here("rmd", "material","tmp", "temp_info_tbl"))
